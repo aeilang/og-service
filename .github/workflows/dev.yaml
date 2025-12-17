@@ -1,0 +1,156 @@
+name: Github Workflow DO OG Dev
+on:
+  push:
+    branches:
+      - "dev"
+env:
+  ARTIFACT_REGISTRY: registry.digitalocean.com/vag
+  IMAGE_NAME: og_staging
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Auth Repo
+        uses: actions/checkout@v2
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v1
+        with:
+          images: ${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_ACCESS_TOKEN_V2 }}
+
+      - name: Configure Docker to use the doctl
+        run: doctl registry login
+
+
+      - name: Push to DO Artifact Registry
+        uses: docker/build-push-action@v3
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+  trivy-scan:
+    needs: build
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Imagine Teams Repo
+        uses: actions/checkout@v2
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_ACCESS_TOKEN_V2 }}
+
+      - name: Configure Docker to use the doctl
+        run: doctl registry login
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+        continue-on-error: true
+
+  update_tag:
+    needs: trivy-scan
+    name: Update Image Tag in Kustomize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Kustomize Repo
+        uses: actions/checkout@v2
+        with:
+          repository: Vyro-ai/vag-backend-configs
+          token: ${{ secrets.GIT_PRIVATE_PACKAGE_SECRET }}
+          ref: main
+
+      - name: Update Image Tag in Kustomize Overlay
+        run: |
+          PR_DIR=./dev/og/kustomize/overlays/dev
+          find "$PR_DIR" -type f -name "patch-image.yaml" -exec sed -i "s|registry.digitalocean.com/vag/og_staging:.*|registry.digitalocean.com/vag/og_staging:${{ github.sha }}|" {} \;
+          find "$PR_DIR" -type f -name "kustomization.yaml" -exec sed -i "s|newTag: .*|newTag: ${{ github.sha }}|" {} \;
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add $PR_DIR/patch-image.yaml
+          git add $PR_DIR/kustomization.yaml
+          if git diff-index --quiet HEAD --; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update Og dev image tag to ${{ github.sha }}"
+            git push origin main
+          fi
+
+  deploy:
+    needs: update_tag
+    name: Deploy with Kustomize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Kustomize Repo
+        uses: actions/checkout@v2
+        with:
+          repository: Vyro-ai/vag-backend-configs
+          token: ${{ secrets.GIT_PRIVATE_PACKAGE_SECRET }}
+          ref: main
+
+      - name: Validate Kustomize
+        id: kustomize
+        uses: int128/kustomize-action@v1
+        with:
+          kustomization: ./dev/og/kustomize/overlays/dev/kustomization.yaml
+
+      - name: Report Kustomize Error
+        if: failure()
+        uses: int128/comment-action@v1
+        with:
+          update-if-exists: replace
+          post: |
+            :x: kustomize error
+            ${{ steps.kustomize.outputs.pretty-errors }}
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_ACCESS_TOKEN_V2 }}
+
+      - name: Retrieve and set kubeconfig for DO cluster
+        run: |
+          doctl kubernetes cluster kubeconfig save anubis-prod --expiry-seconds 600
+
+
+      - name: Apply Kustomize Configuration
+        run: |
+          kustomize build ./dev/og/kustomize/overlays/dev | kubectl apply -f -
+
+  Notify:
+    needs: deploy
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout og Repo
+        uses: actions/checkout@v2
+
+      - name: Notify Slack
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: anubis-pipeline-status
+          SLACK_USERNAME: Action pipeline for Og-Staging
+          SLACK_COLOR: ${{ job.status == 'success' && 'good' || 'danger' }}
+          SLACK_MESSAGE: ${{ job.status == 'success' && 'Og-staging deployed on anubis Cluster' || 'Og-staging **failed** to deploy on Digital Ocean' }}
+        if: always()
