@@ -1,17 +1,19 @@
 import { ImageResponse } from "@takumi-rs/image-response";
 import { NextRequest } from "next/server";
+import fs from "fs";
+import path from "path";
 
 const fonts = [
     {
         name: "Twemoji",
-        data: await fetch(
-            "https://takumi.kane.tw/fonts/TwemojiMozilla-colr.woff2",
-        ).then((r) => r.arrayBuffer()),
+        data: fs.readFileSync(
+            path.join(process.cwd(), "public/fonts/TwemojiMozilla-colr.woff2"),
+        ),
     },
     {
         name: "Geist",
-        data: await fetch("https://takumi.kane.tw/fonts/Geist.woff2").then(
-            (r) => r.arrayBuffer(),
+        data: fs.readFileSync(
+            path.join(process.cwd(), "public/fonts/Geis.woff2"),
         ),
     },
 ];
